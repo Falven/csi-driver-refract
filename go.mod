@@ -1,4 +1,4 @@
-module github.com/kubernetes-csi/csi-driver-host-path
+module github.com/falven/csi-driver-fuse-refract
 
 go 1.21
 
@@ -25,6 +25,7 @@ require (
 	github.com/go-logr/logr v1.3.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/uuid v1.3.1 // indirect
+	github.com/hanwen/go-fuse/v2 v2.4.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/moby/sys/mountinfo v0.6.2 // indirect

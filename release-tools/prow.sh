@@ -200,7 +200,7 @@ kindest/node:v1.18.20@sha256:738cdc23ed4be6cc0b7ea277a2ebcc454c8373d7d8fb991a7fc
 # environment variable, then it must write a suitable test driver configuration
 # into that file in addition to installing the driver.
 configvar CSI_PROW_DRIVER_VERSION "v1.12.0" "CSI driver version"
-configvar CSI_PROW_DRIVER_REPO https://github.com/kubernetes-csi/csi-driver-host-path "CSI driver repo"
+configvar CSI_PROW_DRIVER_REPO https://github.com/falven/csi-driver-fuse-refract "CSI driver repo"
 configvar CSI_PROW_DEPLOYMENT "" "deployment"
 configvar CSI_PROW_DEPLOYMENT_SUFFIX "" "additional suffix in kubernetes-x.yy[suffix].yaml files"
 
@@ -820,7 +820,7 @@ install_snapshot_controller() {
       echo "Deploying snapshot-controller from ${SNAPSHOT_CONTROLLER_YAML} with $NEW_IMG."
       # Replace image in SNAPSHOT_CONTROLLER_YAML with snapshot-controller:csiprow and deploy
       # NOTE: This logic is similar to the logic here:
-      # https://github.com/kubernetes-csi/csi-driver-host-path/blob/v1.4.0/deploy/util/deploy-hostpath.sh#L155
+      # https://github.com/falven/csi-driver-refractblob/v1.4.0/deploy/util/deploy-hostpath.sh#L155
       # Ignore: Double quote to prevent globbing and word splitting.
       # shellcheck disable=SC2086
       # Ignore: Use find instead of ls to better handle non-alphanumeric filenames.
