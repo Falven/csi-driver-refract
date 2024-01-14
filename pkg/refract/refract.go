@@ -26,14 +26,13 @@ import (
 	"sync"
 
 	"github.com/golang/glog"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 	utilexec "k8s.io/utils/exec"
 
 	"github.com/falven/csi-driver-refract/pkg/state"
-	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 const (
@@ -55,9 +54,11 @@ type refract struct {
 	// gRPC calls involving any of the fields below must be serialized
 	// by locking this mutex before starting. Internal helper
 	// functions assume that the mutex has been locked.
-	mutex      sync.Mutex
-	state      state.State
-	LoopbackFS *fuse.Server
+	mutex sync.Mutex
+	state state.State
+
+	// Map to keep track of server instances per volume
+	fuseServers map[string]*fuse.Server
 }
 
 type Config struct {
@@ -118,53 +119,47 @@ func NewRefractDriver(cfg Config) (*refract, error) {
 		return nil, err
 	}
 
-	// Initialize the loopback filesystem
-	loopbackRoot, err := fuse.NewLoopbackRoot(cfg.StateDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create loopback filesystem: %v", err)
-	}
-
-	hp := &refract{
+	rf := &refract{
 		config: cfg,
 		state:  s,
 	}
 
-	return hp, nil
+	return rf, nil
 }
 
-func (hp *refract) Run() error {
+func (rf *refract) Run() error {
 	s := NewNonBlockingGRPCServer()
-	// hp itself implements ControllerServer, NodeServer, and IdentityServer.
-	s.Start(hp.config.Endpoint, hp, hp, hp, hp)
+	// rf itself implements ControllerServer, NodeServer, and IdentityServer.
+	s.Start(rf.config.Endpoint, rf, rf, rf, rf)
 	s.Wait()
 
 	return nil
 }
 
-// getVolumePath returns the canonical path for hostpath volume
-func (hp *refract) getVolumePath(volID string) string {
-	return filepath.Join(hp.config.StateDir, volID)
+// getVolumePath returns the canonical path for refract volume
+func (rf *refract) getVolumePath(volID string) string {
+	return filepath.Join(rf.config.StateDir, volID)
 }
 
 // getSnapshotPath returns the full path to where the snapshot is stored
-func (hp *refract) getSnapshotPath(snapshotID string) string {
-	return filepath.Join(hp.config.StateDir, fmt.Sprintf("%s%s", snapshotID, snapshotExt))
+func (rf *refract) getSnapshotPath(snapshotID string) string {
+	return filepath.Join(rf.config.StateDir, fmt.Sprintf("%s%s", snapshotID, snapshotExt))
 }
 
-// createVolume allocates capacity, creates the directory for the hostpath volume, and
+// createVolume allocates capacity, creates the directory for the refract volume, and
 // adds the volume to the list.
 //
 // It returns the volume path or err if one occurs. That error is suitable as result of a gRPC call.
-func (hp *refract) createVolume(volID, name string, cap int64, volAccessType state.AccessType, ephemeral bool, kind string) (*state.Volume, error) {
+func (rf *refract) createVolume(volID, name string, cap int64, volAccessType state.AccessType, ephemeral bool, kind string) (*state.Volume, error) {
 	// Check for maximum available capacity
-	if cap > hp.config.MaxVolumeSize {
-		return nil, status.Errorf(codes.OutOfRange, "Requested capacity %d exceeds maximum allowed %d", cap, hp.config.MaxVolumeSize)
+	if cap > rf.config.MaxVolumeSize {
+		return nil, status.Errorf(codes.OutOfRange, "Requested capacity %d exceeds maximum allowed %d", cap, rf.config.MaxVolumeSize)
 	}
-	if hp.config.Capacity.Enabled() {
+	if rf.config.Capacity.Enabled() {
 		if kind == "" {
 			// Pick some kind with sufficient remaining capacity.
-			for k, c := range hp.config.Capacity {
-				if hp.sumVolumeSizes(k)+cap <= c.Value() {
+			for k, c := range rf.config.Capacity {
+				if rf.sumVolumeSizes(k)+cap <= c.Value() {
 					kind = k
 					break
 				}
@@ -174,8 +169,8 @@ func (hp *refract) createVolume(volID, name string, cap int64, volAccessType sta
 			// Still nothing?!
 			return nil, status.Errorf(codes.ResourceExhausted, "requested capacity %d of arbitrary storage exceeds all remaining capacity", cap)
 		}
-		used := hp.sumVolumeSizes(kind)
-		available := hp.config.Capacity[kind]
+		used := rf.sumVolumeSizes(kind)
+		available := rf.config.Capacity[kind]
 		if used+cap > available.Value() {
 			return nil, status.Errorf(codes.ResourceExhausted, "requested capacity %d exceeds remaining capacity for %q, %s out of %s already used",
 				cap, kind, resource.NewQuantity(used, resource.BinarySI).String(), available.String())
@@ -184,39 +179,13 @@ func (hp *refract) createVolume(volID, name string, cap int64, volAccessType sta
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("capacity tracking disabled, specifying kind %q is invalid", kind))
 	}
 
-	path := hp.getVolumePath(volID)
+	path := rf.getVolumePath(volID)
 
 	switch volAccessType {
 	case state.MountAccess:
 		err := os.MkdirAll(path, 0777)
 		if err != nil {
 			return nil, err
-		}
-	case state.BlockAccess:
-		executor := utilexec.New()
-		size := fmt.Sprintf("%dM", cap/mib)
-		// Create a block file.
-		_, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				out, err := executor.Command("fallocate", "-l", size, path).CombinedOutput()
-				if err != nil {
-					return nil, fmt.Errorf("failed to create block device: %v, %v", err, string(out))
-				}
-			} else {
-				return nil, fmt.Errorf("failed to stat block device: %v, %v", path, err)
-			}
-		}
-
-		// Associate block file with the loop device.
-		volPathHandler := volumepathhandler.VolumePathHandler{}
-		_, err = volPathHandler.AttachFileDevice(path)
-		if err != nil {
-			// Remove the block file because it'll no longer be used again.
-			if err2 := os.Remove(path); err2 != nil {
-				glog.Errorf("failed to cleanup block file %s: %v", path, err2)
-			}
-			return nil, fmt.Errorf("failed to attach device %v: %v", path, err)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported access type %v", volAccessType)
@@ -232,44 +201,35 @@ func (hp *refract) createVolume(volID, name string, cap int64, volAccessType sta
 		Kind:          kind,
 	}
 	glog.V(4).Infof("adding hostpath volume: %s = %+v", volID, volume)
-	if err := hp.state.UpdateVolume(volume); err != nil {
+	if err := rf.state.UpdateVolume(volume); err != nil {
 		return nil, err
 	}
 	return &volume, nil
 }
 
-// deleteVolume deletes the directory for the hostpath volume.
-func (hp *refract) deleteVolume(volID string) error {
+// deleteVolume deletes the directory for the refract volume.
+func (rf *refract) deleteVolume(volID string) error {
 	glog.V(4).Infof("starting to delete hostpath volume: %s", volID)
 
-	vol, err := hp.state.GetVolumeByID(volID)
+	vol, err := rf.state.GetVolumeByID(volID)
 	if err != nil {
 		// Return OK if the volume is not found.
 		return nil
 	}
 
-	if vol.VolAccessType == state.BlockAccess {
-		volPathHandler := volumepathhandler.VolumePathHandler{}
-		path := hp.getVolumePath(volID)
-		glog.V(4).Infof("deleting loop device for file %s if it exists", path)
-		if err := volPathHandler.DetachFileDevice(path); err != nil {
-			return fmt.Errorf("failed to remove loop device for file %s: %v", path, err)
-		}
-	}
-
-	path := hp.getVolumePath(volID)
+	path := rf.getVolumePath(volID)
 	if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := hp.state.DeleteVolume(volID); err != nil {
+	if err := rf.state.DeleteVolume(volID); err != nil {
 		return err
 	}
 	glog.V(4).Infof("deleted hostpath volume: %s = %+v", volID, vol)
 	return nil
 }
 
-func (hp *refract) sumVolumeSizes(kind string) (sum int64) {
-	for _, volume := range hp.state.GetVolumes() {
+func (rf *refract) sumVolumeSizes(kind string) (sum int64) {
+	for _, volume := range rf.state.GetVolumes() {
 		if volume.Kind == kind {
 			sum += volume.VolSize
 		}
@@ -277,9 +237,9 @@ func (hp *refract) sumVolumeSizes(kind string) (sum int64) {
 	return
 }
 
-// hostPathIsEmpty is a simple check to determine if the specified hostpath directory
+// refractIsEmpty is a simple check to determine if the specified refract directory
 // is empty or not.
-func hostPathIsEmpty(p string) (bool, error) {
+func refractIsEmpty(p string) (bool, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return true, fmt.Errorf("unable to open hostpath volume, error: %v", err)
@@ -294,8 +254,8 @@ func hostPathIsEmpty(p string) (bool, error) {
 }
 
 // loadFromSnapshot populates the given destPath with data from the snapshotID
-func (hp *refract) loadFromSnapshot(size int64, snapshotId, destPath string, mode state.AccessType) error {
-	snapshot, err := hp.state.GetSnapshotByID(snapshotId)
+func (rf *refract) loadFromSnapshot(size int64, snapshotId, destPath string, mode state.AccessType) error {
+	snapshot, err := rf.state.GetSnapshotByID(snapshotId)
 	if err != nil {
 		return err
 	}
@@ -311,8 +271,6 @@ func (hp *refract) loadFromSnapshot(size int64, snapshotId, destPath string, mod
 	switch mode {
 	case state.MountAccess:
 		cmd = []string{"tar", "zxvf", snapshotPath, "-C", destPath}
-	case state.BlockAccess:
-		cmd = []string{"dd", "if=" + snapshotPath, "of=" + destPath}
 	default:
 		return status.Errorf(codes.InvalidArgument, "unknown accessType: %d", mode)
 	}
@@ -328,61 +286,48 @@ func (hp *refract) loadFromSnapshot(size int64, snapshotId, destPath string, mod
 }
 
 // loadFromVolume populates the given destPath with data from the srcVolumeID
-func (hp *refract) loadFromVolume(size int64, srcVolumeId, destPath string, mode state.AccessType) error {
-	hostPathVolume, err := hp.state.GetVolumeByID(srcVolumeId)
+func (rf *refract) loadFromVolume(size int64, srcVolumeId, destPath string, mode state.AccessType) error {
+	refractVolume, err := rf.state.GetVolumeByID(srcVolumeId)
 	if err != nil {
 		return err
 	}
-	if hostPathVolume.VolSize > size {
-		return status.Errorf(codes.InvalidArgument, "volume %v size %v is greater than requested volume size %v", srcVolumeId, hostPathVolume.VolSize, size)
+	if refractVolume.VolSize > size {
+		return status.Errorf(codes.InvalidArgument, "volume %v size %v is greater than requested volume size %v", srcVolumeId, refractVolume.VolSize, size)
 	}
-	if mode != hostPathVolume.VolAccessType {
+	if mode != refractVolume.VolAccessType {
 		return status.Errorf(codes.InvalidArgument, "volume %v mode is not compatible with requested mode", srcVolumeId)
 	}
 
 	switch mode {
 	case state.MountAccess:
-		return loadFromFilesystemVolume(hostPathVolume, destPath)
-	case state.BlockAccess:
-		return loadFromBlockVolume(hostPathVolume, destPath)
+		return loadFromFilesystemVolume(refractVolume, destPath)
 	default:
 		return status.Errorf(codes.InvalidArgument, "unknown accessType: %d", mode)
 	}
 }
 
-func loadFromFilesystemVolume(hostPathVolume state.Volume, destPath string) error {
-	srcPath := hostPathVolume.VolPath
-	isEmpty, err := hostPathIsEmpty(srcPath)
+func loadFromFilesystemVolume(refractVolume state.Volume, destPath string) error {
+	srcPath := refractVolume.VolPath
+	isEmpty, err := refractIsEmpty(srcPath)
 	if err != nil {
-		return fmt.Errorf("failed verification check of source hostpath volume %v: %w", hostPathVolume.VolID, err)
+		return fmt.Errorf("failed verification check of source hostpath volume %v: %w", refractVolume.VolID, err)
 	}
 
-	// If the source hostpath volume is empty it's a noop and we just move along, otherwise the cp call will fail with a a file stat error DNE
+	// If the source refract volume is empty it's a noop and we just move along, otherwise the cp call will fail with a a file stat error DNE
 	if !isEmpty {
 		args := []string{"-a", srcPath + "/.", destPath + "/"}
 		executor := utilexec.New()
 		out, err := executor.Command("cp", args...).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("failed pre-populate data from volume %v: %s: %w", hostPathVolume.VolID, out, err)
+			return fmt.Errorf("failed pre-populate data from volume %v: %s: %w", refractVolume.VolID, out, err)
 		}
 	}
 	return nil
 }
 
-func loadFromBlockVolume(hostPathVolume state.Volume, destPath string) error {
-	srcPath := hostPathVolume.VolPath
-	args := []string{"if=" + srcPath, "of=" + destPath}
-	executor := utilexec.New()
-	out, err := executor.Command("dd", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed pre-populate data from volume %v: %w: %s", hostPathVolume.VolID, err, out)
-	}
-	return nil
-}
-
-func (hp *refract) getAttachCount() int64 {
+func (rf *refract) getAttachCount() int64 {
 	count := int64(0)
-	for _, vol := range hp.state.GetVolumes() {
+	for _, vol := range rf.state.GetVolumes() {
 		if vol.Attached {
 			count++
 		}
@@ -390,15 +335,10 @@ func (hp *refract) getAttachCount() int64 {
 	return count
 }
 
-func (hp *refract) createSnapshotFromVolume(vol state.Volume, file string) error {
+func (rf *refract) createSnapshotFromVolume(vol state.Volume, file string) error {
 	var cmd []string
-	if vol.VolAccessType == state.BlockAccess {
-		glog.V(4).Infof("Creating snapshot of Raw Block Mode Volume")
-		cmd = []string{"cp", vol.VolPath, file}
-	} else {
-		glog.V(4).Infof("Creating snapshot of Filsystem Mode Volume")
-		cmd = []string{"tar", "czf", file, "-C", vol.VolPath, "."}
-	}
+	glog.V(4).Infof("Creating snapshot of Filsystem Mode Volume")
+	cmd = []string{"tar", "czf", file, "-C", vol.VolPath, "."}
 	executor := utilexec.New()
 	out, err := executor.Command(cmd[0], cmd[1:]...).CombinedOutput()
 	if err != nil {

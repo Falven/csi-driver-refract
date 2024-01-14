@@ -24,28 +24,28 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func (hp *refract) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+func (rf *refract) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
 	glog.V(5).Infof("Using default GetPluginInfo")
 
-	if hp.config.DriverName == "" {
+	if rf.config.DriverName == "" {
 		return nil, status.Error(codes.Unavailable, "Driver name not configured")
 	}
 
-	if hp.config.VendorVersion == "" {
+	if rf.config.VendorVersion == "" {
 		return nil, status.Error(codes.Unavailable, "Driver is missing version")
 	}
 
 	return &csi.GetPluginInfoResponse{
-		Name:          hp.config.DriverName,
-		VendorVersion: hp.config.VendorVersion,
+		Name:          rf.config.DriverName,
+		VendorVersion: rf.config.VendorVersion,
 	}, nil
 }
 
-func (hp *refract) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+func (rf *refract) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	return &csi.ProbeResponse{}, nil
 }
 
-func (hp *refract) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
+func (rf *refract) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	glog.V(5).Infof("Using default capabilities")
 	caps := []*csi.PluginCapability{
 		{
@@ -63,7 +63,7 @@ func (hp *refract) GetPluginCapabilities(ctx context.Context, req *csi.GetPlugin
 			},
 		},
 	}
-	if hp.config.EnableTopology {
+	if rf.config.EnableTopology {
 		caps = append(caps, &csi.PluginCapability{
 			Type: &csi.PluginCapability_Service_{
 				Service: &csi.PluginCapability_Service{

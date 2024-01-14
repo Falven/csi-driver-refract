@@ -126,14 +126,14 @@ func checkMountPointExist(volumePath string) (bool, error) {
 	return false, nil
 }
 
-func (hp *refract) checkPVCapacityValid(volID string) (bool, error) {
-	volumePath := hp.getVolumePath(volID)
+func (rf *refract) checkPVCapacityValid(volID string) (bool, error) {
+	volumePath := rf.getVolumePath(volID)
 	_, fscapacity, _, _, _, _, err := fs.Info(volumePath)
 	if err != nil {
 		return false, fmt.Errorf("failed to get capacity info: %+v", err)
 	}
 
-	volume, err := hp.state.GetVolumeByID(volID)
+	volume, err := rf.state.GetVolumeByID(volID)
 	if err != nil {
 		return false, err
 	}
@@ -146,8 +146,8 @@ func getPVStats(volumePath string) (available int64, capacity int64, used int64,
 	return fs.Info(volumePath)
 }
 
-func (hp *refract) checkPVUsage(volID string) (bool, error) {
-	volumePath := hp.getVolumePath(volID)
+func (rf *refract) checkPVUsage(volID string) (bool, error) {
+	volumePath := rf.getVolumePath(volID)
 	fsavailable, _, _, _, _, _, err := fs.Info(volumePath)
 	if err != nil {
 		return false, err
@@ -157,8 +157,8 @@ func (hp *refract) checkPVUsage(volID string) (bool, error) {
 	return fsavailable > 0, nil
 }
 
-func (hp *refract) doHealthCheckInControllerSide(volID string) (bool, string) {
-	volumePath := hp.getVolumePath(volID)
+func (rf *refract) doHealthCheckInControllerSide(volID string) (bool, string) {
+	volumePath := rf.getVolumePath(volID)
 	glog.V(3).Infof("Volume with ID %s has path %s.", volID, volumePath)
 	spExist, err := checkPathExist(volumePath)
 	if err != nil {
@@ -169,7 +169,7 @@ func (hp *refract) doHealthCheckInControllerSide(volID string) (bool, string) {
 		return false, "The source path of the volume doesn't exist"
 	}
 
-	capValid, err := hp.checkPVCapacityValid(volID)
+	capValid, err := rf.checkPVCapacityValid(volID)
 	if err != nil {
 		return false, err.Error()
 	}
@@ -178,7 +178,7 @@ func (hp *refract) doHealthCheckInControllerSide(volID string) (bool, string) {
 		return false, "The capacity of volume is greater than actual storage"
 	}
 
-	available, err := hp.checkPVUsage(volID)
+	available, err := rf.checkPVUsage(volID)
 	if err != nil {
 		return false, err.Error()
 	}
@@ -190,8 +190,8 @@ func (hp *refract) doHealthCheckInControllerSide(volID string) (bool, string) {
 	return true, ""
 }
 
-func (hp *refract) doHealthCheckInNodeSide(volID string) (bool, string) {
-	volumePath := hp.getVolumePath(volID)
+func (rf *refract) doHealthCheckInNodeSide(volID string) (bool, string) {
+	volumePath := rf.getVolumePath(volID)
 	mpExist, err := checkMountPointExist(volumePath)
 	if err != nil {
 		return false, err.Error()

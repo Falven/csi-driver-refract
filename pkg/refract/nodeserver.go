@@ -19,15 +19,17 @@ package refract
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/falven/csi-driver-refract/pkg/state"
 	"github.com/golang/glog"
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 	"k8s.io/utils/mount"
 )
 
@@ -37,7 +39,7 @@ const (
 	failedPreconditionAccessModeConflict = "volume uses SINGLE_NODE_SINGLE_WRITER access mode and is already mounted at a different target path"
 )
 
-func (hp *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (rf *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	// Check arguments
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
@@ -51,30 +53,31 @@ func (hp *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVo
 
 	targetPath := req.GetTargetPath()
 	ephemeralVolume := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true" ||
-		req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "" && hp.config.Ephemeral // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
+		req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "" && rf.config.Ephemeral // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
 
-	if req.GetVolumeCapability().GetBlock() != nil &&
-		req.GetVolumeCapability().GetMount() != nil {
-		return nil, status.Error(codes.InvalidArgument, "cannot have both block and mount access type")
+	// Disable block access support
+	if req.GetVolumeCapability().GetBlock() != nil {
+		return nil, status.Error(codes.InvalidArgument, "block access type is not supported")
 	}
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
+	// Initialize mounter
 	mounter := mount.New("")
 
 	// if ephemeral is specified, create volume here to avoid errors
 	if ephemeralVolume {
 		volID := req.GetVolumeId()
 		volName := fmt.Sprintf("ephemeral-%s", volID)
-		if _, err := hp.state.GetVolumeByName(volName); err != nil {
+		if _, err := rf.state.GetVolumeByName(volName); err != nil {
 			// Volume doesn't exist, create it
 			kind := req.GetVolumeContext()[storageKind]
 			// Configurable size would be nice. For now we use a small, fixed volume size of 100Mi.
 			volSize := int64(100 * 1024 * 1024)
-			vol, err := hp.createVolume(req.GetVolumeId(), volName, volSize, state.MountAccess, ephemeralVolume, kind)
+			vol, err := rf.createVolume(req.GetVolumeId(), volName, volSize, state.MountAccess, ephemeralVolume, kind)
 			if err != nil && !os.IsExist(err) {
 				glog.Error("ephemeral mode failed to create volume: ", err)
 				return nil, err
@@ -83,7 +86,7 @@ func (hp *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVo
 		}
 	}
 
-	vol, err := hp.state.GetVolumeByID(req.GetVolumeId())
+	vol, err := rf.state.GetVolumeByID(req.GetVolumeId())
 	if err != nil {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
@@ -101,49 +104,7 @@ func (hp *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVo
 		}
 	}
 
-	if req.GetVolumeCapability().GetBlock() != nil {
-		if vol.VolAccessType != state.BlockAccess {
-			return nil, status.Error(codes.InvalidArgument, "cannot publish a non-block volume as block volume")
-		}
-
-		volPathHandler := volumepathhandler.VolumePathHandler{}
-
-		// Get loop device from the volume path.
-		loopDevice, err := volPathHandler.GetLoopDevice(vol.VolPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get the loop device: %w", err)
-		}
-
-		// Check if the target path exists. Create if not present.
-		_, err = os.Lstat(targetPath)
-		if os.IsNotExist(err) {
-			if err = makeFile(targetPath); err != nil {
-				return nil, fmt.Errorf("failed to create target path: %w", err)
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to check if the target block file exists: %w", err)
-		}
-
-		// Check if the target path is already mounted. Prevent remounting.
-		notMount, err := mount.IsNotMountPoint(mounter, targetPath)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("error checking path %s for mount: %w", targetPath, err)
-			}
-			notMount = true
-		}
-		if !notMount {
-			// It's already mounted.
-			glog.V(5).Infof("Skipping bind-mounting subpath %s: already mounted", targetPath)
-			return &csi.NodePublishVolumeResponse{}, nil
-		}
-
-		options := []string{"bind"}
-		if err := mounter.Mount(loopDevice, targetPath, "", options); err != nil {
-			return nil, fmt.Errorf("failed to mount block device: %s at %s: %w", loopDevice, targetPath, err)
-		}
-	} else if req.GetVolumeCapability().GetMount() != nil {
+	if req.GetVolumeCapability().GetMount() != nil {
 		if vol.VolAccessType != state.MountAccess {
 			return nil, status.Error(codes.InvalidArgument, "cannot publish a non-mount volume as mount volume")
 		}
@@ -179,33 +140,50 @@ func (hp *refract) NodePublishVolume(ctx context.Context, req *csi.NodePublishVo
 		glog.V(4).Infof("target %v\nfstype %v\ndevice %v\nreadonly %v\nvolumeId %v\nattributes %v\nmountflags %v\n",
 			targetPath, fsType, deviceId, readOnly, volumeId, attrib, mountFlags)
 
-		options := []string{"bind"}
-		if readOnly {
-			options = append(options, "ro")
+		if readOnly && !slices.Contains(mountFlags, "ro") {
+			mountFlags = append(mountFlags, "ro")
 		}
-		path := hp.getVolumePath(volumeId)
 
-		if err := mounter.Mount(path, targetPath, "", options); err != nil {
+		sourcePath := rf.getVolumePath(volumeId)
+
+		options := &fs.Options{
+			MountOptions: fuse.MountOptions{
+				FsName:  "",
+				Options: mountFlags,
+			},
+		}
+
+		refractRoot, err := NewRefractRoot(sourcePath)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to initialize: %v", err)
+		}
+
+		server, err := fs.Mount(targetPath, refractRoot, options)
+		if err != nil {
 			var errList strings.Builder
 			errList.WriteString(err.Error())
 			if vol.Ephemeral {
-				if rmErr := os.RemoveAll(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				if rmErr := os.RemoveAll(sourcePath); rmErr != nil && !os.IsNotExist(rmErr) {
 					errList.WriteString(fmt.Sprintf(" :%s", rmErr.Error()))
 				}
 			}
-			return nil, fmt.Errorf("failed to mount device: %s at %s: %s", path, targetPath, errList.String())
+			return nil, fmt.Errorf("failed to mount device: %s at %s: %s", sourcePath, targetPath, errList.String())
 		}
+
+		rf.fuseServers[req.GetVolumeId()] = server
+
+		go server.Serve()
 	}
 
-	vol.NodeID = hp.config.NodeID
+	vol.NodeID = rf.config.NodeID
 	vol.Published.Add(targetPath)
-	if err := hp.state.UpdateVolume(vol); err != nil {
+	if err := rf.state.UpdateVolume(vol); err != nil {
 		return nil, err
 	}
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (hp *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (rf *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 
 	// Check arguments
 	if len(req.GetVolumeId()) == 0 {
@@ -219,10 +197,10 @@ func (hp *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubli
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
-	vol, err := hp.state.GetVolumeByID(volumeID)
+	vol, err := rf.state.GetVolumeByID(volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -239,9 +217,9 @@ func (hp *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubli
 		}
 	} else if !notMnt {
 		// Unmounting the image or filesystem.
-		err = mount.New("").Unmount(targetPath)
-		if err != nil {
-			return nil, fmt.Errorf("unmount target path: %w", err)
+		if server, ok := rf.fuseServers[volumeID]; ok {
+			server.Unmount()
+			delete(rf.fuseServers, volumeID)
 		}
 	}
 	// Delete the mount point.
@@ -253,12 +231,12 @@ func (hp *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubli
 
 	if vol.Ephemeral {
 		glog.V(4).Infof("deleting volume %s", volumeID)
-		if err := hp.deleteVolume(volumeID); err != nil && !os.IsNotExist(err) {
+		if err := rf.deleteVolume(volumeID); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to delete volume: %w", err)
 		}
 	} else {
 		vol.Published.Remove(targetPath)
-		if err := hp.state.UpdateVolume(vol); err != nil {
+		if err := rf.state.UpdateVolume(vol); err != nil {
 			return nil, err
 		}
 	}
@@ -266,7 +244,7 @@ func (hp *refract) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubli
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (hp *refract) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (rf *refract) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 
 	// Check arguments
 	if len(req.GetVolumeId()) == 0 {
@@ -282,15 +260,15 @@ func (hp *refract) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolume
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
-	vol, err := hp.state.GetVolumeByID(req.VolumeId)
+	vol, err := rf.state.GetVolumeByID(req.VolumeId)
 	if err != nil {
 		return nil, err
 	}
 
-	if hp.config.EnableAttach && !vol.Attached {
+	if rf.config.EnableAttach && !vol.Attached {
 		return nil, status.Errorf(codes.Internal, "ControllerPublishVolume must be called on volume '%s' before staging on node",
 			vol.VolID)
 	}
@@ -305,14 +283,14 @@ func (hp *refract) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolume
 	}
 
 	vol.Staged.Add(stagingTargetPath)
-	if err := hp.state.UpdateVolume(vol); err != nil {
+	if err := rf.state.UpdateVolume(vol); err != nil {
 		return nil, err
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func (hp *refract) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (rf *refract) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 
 	// Check arguments
 	if len(req.GetVolumeId()) == 0 {
@@ -325,10 +303,10 @@ func (hp *refract) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVo
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
-	vol, err := hp.state.GetVolumeByID(req.VolumeId)
+	vol, err := rf.state.GetVolumeByID(req.VolumeId)
 	if err != nil {
 		return nil, err
 	}
@@ -342,33 +320,33 @@ func (hp *refract) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVo
 		return nil, status.Errorf(codes.Internal, "volume %q is still published at %q on node %q", vol.VolID, vol.Published, vol.NodeID)
 	}
 	vol.Staged.Remove(stagingTargetPath)
-	if err := hp.state.UpdateVolume(vol); err != nil {
+	if err := rf.state.UpdateVolume(vol); err != nil {
 		return nil, err
 	}
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (hp *refract) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+func (rf *refract) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	resp := &csi.NodeGetInfoResponse{
-		NodeId:            hp.config.NodeID,
-		MaxVolumesPerNode: hp.config.MaxVolumesPerNode,
+		NodeId:            rf.config.NodeID,
+		MaxVolumesPerNode: rf.config.MaxVolumesPerNode,
 	}
 
-	if hp.config.EnableTopology {
+	if rf.config.EnableTopology {
 		resp.AccessibleTopology = &csi.Topology{
-			Segments: map[string]string{TopologyKeyNode: hp.config.NodeID},
+			Segments: map[string]string{TopologyKeyNode: rf.config.NodeID},
 		}
 	}
 
-	if hp.config.AttachLimit > 0 {
-		resp.MaxVolumesPerNode = hp.config.AttachLimit
+	if rf.config.AttachLimit > 0 {
+		resp.MaxVolumesPerNode = rf.config.AttachLimit
 	}
 
 	return resp, nil
 }
 
-func (hp *refract) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (rf *refract) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	caps := []*csi.NodeServiceCapability{
 		{
 			Type: &csi.NodeServiceCapability_Rpc{
@@ -399,7 +377,7 @@ func (hp *refract) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapa
 			},
 		},
 	}
-	if hp.config.EnableVolumeExpansion && !hp.config.DisableNodeExpansion {
+	if rf.config.EnableVolumeExpansion && !rf.config.DisableNodeExpansion {
 		caps = append(caps, &csi.NodeServiceCapability{
 			Type: &csi.NodeServiceCapability_Rpc{
 				Rpc: &csi.NodeServiceCapability_RPC{
@@ -412,7 +390,7 @@ func (hp *refract) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapa
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: caps}, nil
 }
 
-func (hp *refract) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+func (rf *refract) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	if len(in.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
@@ -422,10 +400,10 @@ func (hp *refract) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolume
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
-	volume, err := hp.state.GetVolumeByID(in.GetVolumeId())
+	volume, err := rf.state.GetVolumeByID(in.GetVolumeId())
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +412,7 @@ func (hp *refract) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolume
 		return nil, status.Errorf(codes.NotFound, "Could not get file information from %s: %+v", in.GetVolumePath(), err)
 	}
 
-	healthy, msg := hp.doHealthCheckInNodeSide(in.GetVolumeId())
+	healthy, msg := rf.doHealthCheckInNodeSide(in.GetVolumeId())
 	glog.V(3).Infof("Healthy state: %+v Volume: %+v", volume.VolName, healthy)
 	available, capacity, used, inodes, inodesFree, inodesUsed, err := getPVStats(in.GetVolumePath())
 	if err != nil {
@@ -464,8 +442,8 @@ func (hp *refract) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolume
 }
 
 // NodeExpandVolume is only implemented so the driver can be used for e2e testing.
-func (hp *refract) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	if !hp.config.EnableVolumeExpansion {
+func (rf *refract) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	if !rf.config.EnableVolumeExpansion {
 		return nil, status.Error(codes.Unimplemented, "NodeExpandVolume is not supported")
 	}
 
@@ -476,10 +454,10 @@ func (hp *refract) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolu
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
-	hp.mutex.Lock()
-	defer hp.mutex.Unlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
-	vol, err := hp.state.GetVolumeByID(volID)
+	vol, err := rf.state.GetVolumeByID(volID)
 	if err != nil {
 		return nil, err
 	}
@@ -494,8 +472,8 @@ func (hp *refract) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolu
 		return nil, status.Error(codes.InvalidArgument, "Capacity range not provided")
 	}
 	capacity := int64(capRange.GetRequiredBytes())
-	if capacity > hp.config.MaxVolumeExpansionSizeNode {
-		return nil, status.Errorf(codes.OutOfRange, "Requested capacity %d exceeds maximum allowed %d", capacity, hp.config.MaxVolumeExpansionSizeNode)
+	if capacity > rf.config.MaxVolumeExpansionSizeNode {
+		return nil, status.Errorf(codes.OutOfRange, "Requested capacity %d exceeds maximum allowed %d", capacity, rf.config.MaxVolumeExpansionSizeNode)
 	}
 
 	info, err := os.Stat(volPath)
@@ -508,28 +486,11 @@ func (hp *refract) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolu
 		if vol.VolAccessType != state.MountAccess {
 			return nil, status.Errorf(codes.InvalidArgument, "Volume %s is not a directory", volID)
 		}
-	case m&os.ModeDevice != 0:
-		if vol.VolAccessType != state.BlockAccess {
-			return nil, status.Errorf(codes.InvalidArgument, "Volume %s is not a block device", volID)
-		}
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "Volume %s is invalid", volID)
 	}
 
 	return &csi.NodeExpandVolumeResponse{}, nil
-}
-
-// makeFile ensures that the file exists, creating it if necessary.
-// The parent directory must exist.
-func makeFile(pathname string) error {
-	f, err := os.OpenFile(pathname, os.O_CREATE, os.FileMode(0644))
-	defer f.Close()
-	if err != nil {
-		if !os.IsExist(err) {
-			return err
-		}
-	}
-	return nil
 }
 
 // hasSingleNodeSingleWriterAccessMode checks if the publish request uses the
