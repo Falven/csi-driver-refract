@@ -109,6 +109,8 @@ func main() {
 		cfg.MaxVolumeExpansionSizeNode = cfg.MaxVolumeSize
 	}
 
+	cfg.RootDir = cfg.StateDir
+
 	driver, err := refract.NewRefractDriver(cfg)
 	if err != nil {
 		fmt.Printf("Failed to initialize driver: %s", err.Error())

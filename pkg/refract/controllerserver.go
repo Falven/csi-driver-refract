@@ -138,9 +138,14 @@ func (rf *refract) CreateVolume(ctx context.Context, req *csi.CreateVolumeReques
 		}, nil
 	}
 
+	parameters := req.GetParameters()
+
 	volumeID := uuid.NewUUID().String()
-	kind := req.GetParameters()[storageKind]
-	vol, err := rf.createVolume(volumeID, req.GetName(), capacity, requestedAccessType, false /* ephemeral */, kind)
+	kind := parameters[storageKind]
+
+	rootDir, _ := parameters["storagePath"]
+
+	vol, err := rf.createVolume(volumeID, req.GetName(), capacity, requestedAccessType, false /* ephemeral */, kind, rootDir)
 	if err != nil {
 		return nil, err
 	}

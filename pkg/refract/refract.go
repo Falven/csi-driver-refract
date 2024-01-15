@@ -68,6 +68,7 @@ type Config struct {
 	NodeID                        string
 	VendorVersion                 string
 	StateDir                      string
+	RootDir                       string
 	MaxVolumesPerNode             int64
 	MaxVolumeSize                 int64
 	AttachLimit                   int64
@@ -150,7 +151,7 @@ func (rf *refract) getSnapshotPath(snapshotID string) string {
 // adds the volume to the list.
 //
 // It returns the volume path or err if one occurs. That error is suitable as result of a gRPC call.
-func (rf *refract) createVolume(volID, name string, cap int64, volAccessType state.AccessType, ephemeral bool, kind string) (*state.Volume, error) {
+func (rf *refract) createVolume(volID, name string, cap int64, volAccessType state.AccessType, ephemeral bool, kind string, rootDir string) (*state.Volume, error) {
 	// Check for maximum available capacity
 	if cap > rf.config.MaxVolumeSize {
 		return nil, status.Errorf(codes.OutOfRange, "Requested capacity %d exceeds maximum allowed %d", cap, rf.config.MaxVolumeSize)
@@ -179,6 +180,10 @@ func (rf *refract) createVolume(volID, name string, cap int64, volAccessType sta
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("capacity tracking disabled, specifying kind %q is invalid", kind))
 	}
 
+	if rootDir != "" {
+		glog.V(4).Infof("changing rootDir from %v to %v", rf.config.RootDir, rootDir)
+		rf.config.RootDir = rootDir
+	}
 	path := rf.getVolumePath(volID)
 
 	switch volAccessType {
