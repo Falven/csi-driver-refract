@@ -4,7 +4,7 @@ go 1.21
 
 require (
 	github.com/container-storage-interface/spec v1.9.0
-	github.com/golang/glog v1.2.0
+	github.com/golang/glog v1.2.3
 	github.com/golang/protobuf v1.5.4
 	github.com/hanwen/go-fuse/v2 v2.4.2
 	github.com/kubernetes-csi/csi-lib-utils v0.17.0
