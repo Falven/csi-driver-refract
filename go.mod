@@ -9,7 +9,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.4.2
 	github.com/kubernetes-csi/csi-lib-utils v0.17.0
 	github.com/pborman/uuid v1.2.1
-	github.com/stretchr/testify v1.8.4
+	github.com/stretchr/testify v1.10.0
 	golang.org/x/net v0.19.0
 	golang.org/x/sys v0.15.0
 	google.golang.org/grpc v1.59.0
